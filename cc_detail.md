@@ -1064,4 +1064,440 @@ skills, 10% before deferring tools, 5GB of output, 45s to stall, 5s to shut down
 If you're building a harness, those two moves — **name the state, then cap it** — are what
 separate a loop that works in a demo from one that survives a 3,000-turn session.
 
+---
+
+# Follow-up Questions
+
+## 6. How steering is implemented
+
+Steering is the ability to type while Claude is working and have the message take effect
+mid-task. The tip string names the feature:
+[tipRegistry.ts:268](cc-code/restored-src/src/services/tips/tipRegistry.ts#L268) —
+*"Send messages to Claude while it works to steer Claude in real-time."*
+
+The key realisation: **steering is not an interrupt.** It is a queue-and-drain mechanism,
+with interruption as a narrow special case.
+
+### Step 1 — Submit while busy enqueues; it does not start a turn
+
+[handlePromptSubmit.ts:312-348](cc-code/restored-src/src/utils/handlePromptSubmit.ts#L312-L348):
+
+```ts
+if (queryGuard.isActive || isExternalLoading) {
+  // Only allow prompt and bash mode commands to be queued
+  if (mode !== 'prompt' && mode !== 'bash') return
+  ...
+  enqueue({ value: finalInput.trim(), mode, pastedContents, uuid })
+  onInputChange(''); clearBuffer()
+  return
+}
+```
+
+The input box clears immediately, so it *feels* sent. Nothing has been aborted yet.
+
+### Step 2 — Whether to cut the turn short is decided per-tool
+
+Immediately before enqueueing
+([handlePromptSubmit.ts:318-331](cc-code/restored-src/src/utils/handlePromptSubmit.ts#L318-L331)):
+
+```ts
+// Interrupt the current turn when all executing tools have
+// interruptBehavior 'cancel' (e.g. SleepTool).
+if (params.hasInterruptibleToolInProgress) {
+  logEvent('tengu_cancel', { source: 'interrupt_on_submit', ... })
+  params.abortController?.abort('interrupt')
+}
+```
+
+That flag is recomputed live by the executor
+([StreamingToolExecutor.ts:254-260](cc-code/restored-src/src/services/tools/StreamingToolExecutor.ts#L254-L260)):
+
+```ts
+this.toolUseContext.setHasInterruptibleToolInProgress?.(
+  executing.length > 0 &&
+  executing.every(t => this.getToolInterruptBehavior(t) === 'cancel'))
+```
+
+`every`, not `some` — **one non-cancellable tool blocks the interrupt.** The per-tool
+contract is [Tool.ts:407-416](cc-code/restored-src/src/Tool.ts#L407-L416):
+
+> - `'cancel'` — stop the tool and discard its result
+> - `'block'` — keep running; the new message waits
+>
+> Defaults to `'block'` when not implemented.
+
+So an in-flight Write or Bash finishes; a Sleep gets cut. Fail-safe by default.
+
+### Step 3 — `'interrupt'` is a distinct abort reason, and downstream code reads it
+
+This is the key design move: `abort('interrupt')` is deliberately *not* the same as Ctrl-C.
+
+- [StreamingToolExecutor.ts:219-229](cc-code/restored-src/src/services/tools/StreamingToolExecutor.ts#L219-L229)
+  — cancels only tools that opted in; others return `null` (no synthetic error).
+- [ShellCommand.ts:186-192](cc-code/restored-src/src/utils/ShellCommand.ts#L186-L192) —
+  *"On `'interrupt'`, don't kill — let the caller background the process so the model can
+  see partial output."* A running command survives as a background task.
+- [query.ts:1046](cc-code/restored-src/src/query.ts#L1046) and
+  [:1501](cc-code/restored-src/src/query.ts#L1501) — suppresses the
+  "[Request interrupted by user]" message: *"Skip the interruption message for
+  submit-interrupts — the queued user message that follows provides sufficient context."*
+- [utils/hooks.ts:215](cc-code/restored-src/src/utils/hooks.ts#L215) — hook handlers no-op
+  on `'interrupt'`.
+
+### Step 4 — The drain: where steering actually lands
+
+Inside the loop, after tools complete but before the next model call
+([query.ts:1566-1590](cc-code/restored-src/src/query.ts#L1566-L1590)):
+
+```ts
+const sleepRan = toolUseBlocks.some(b => b.name === SLEEP_TOOL_NAME)
+const queuedCommandsSnapshot = getCommandsByMaxPriority(sleepRan ? 'later' : 'next')
+  .filter(cmd => {
+    if (isSlashCommand(cmd)) return false          // must go through the REPL
+    if (isMainThread) return cmd.agentId === undefined
+    return cmd.mode === 'task-notification' && cmd.agentId === currentAgentId
+  })
+
+for await (const attachment of getAttachmentMessages(null, ..., queuedCommandsSnapshot, ...)) {
+  yield attachment
+  toolResults.push(attachment)
+}
+```
+
+The message becomes a `queued_command` attachment
+([attachments.ts:1046-1080](cc-code/restored-src/src/utils/attachments.ts#L1046-L1080))
+appended to `toolResults` — so it rides into the **next iteration's** `messages` array
+alongside the tool results, and the model reads it on its very next call, mid-task.
+
+Three filters matter: slash commands are excluded (they need `processSlashCommand` after
+the turn); subagents drain only notifications addressed to them, never user prompts; and
+if the model called Sleep it is explicitly idle, so `'later'`-priority items drain too.
+
+### Step 5 — Steering stays visible in the transcript
+
+[messages.ts:3748-3756](cc-code/restored-src/src/utils/messages.ts#L3748-L3756), a fix
+worth noting:
+
+> *"Only hide from the transcript if the queued command was itself system-generated. Human
+> input drained mid-turn has no origin and no `isMeta` — it should stay visible. Previously
+> this hardcoded `isMeta: true`, which hid user-typed messages."*
+
+### Step 6 — Priority: steering versus background noise
+
+One queue, ordered
+([messageQueueManager.ts:126-143](cc-code/restored-src/src/utils/messageQueueManager.ts#L126-L143)):
+user input defaults to `'next'`, task notifications to `'later'` — *"so user input is
+processed first."* A `'now'` tier forces an abort on arrival
+([REPL.tsx:4099-4104](cc-code/restored-src/src/screens/REPL.tsx#L4099-L4104)), used by
+remote clients. Anything left when the turn ends is picked up by
+[`processQueueIfReady`](cc-code/restored-src/src/utils/queueProcessor.ts#L52) as a normal
+new turn.
+
+### The shape, in one line
+
+> **Enqueue → decide interruptibility per-tool → abort with a *typed* reason that
+> downstream code treats gently → drain into the current turn as an attachment.**
+
+The transferable lesson: steering is a **queue design problem, not a cancellation
+problem.** Cancelling is the rare special case, gated by a per-tool declaration that fails
+closed to `'block'`. Everything else is "let the turn finish its current step, then splice
+the user's words in before the next model call."
+
+---
+
+## 7. How tasks are distributed across agents by capability
+
+**There is no scheduler.** The harness never matches tasks to agents algorithmically. It
+declares capability as data, renders that data into the model's context, lets the model
+choose, then *enforces* the declaration at runtime.
+
+### The subagent framework: declare → advertise → model picks → enforce
+
+**1. Capability is a declarative record.** Every agent is an
+[`AgentDefinition`](cc-code/restored-src/src/tools/AgentTool/loadAgentsDir.ts#L105-L131)
+loaded from markdown frontmatter, plugin manifests, or built-in modules:
+
+| Field | What it constrains |
+|---|---|
+| `agentType` | the handle the model calls it by |
+| `whenToUse` | **the routing signal** — prose, read by the model |
+| `tools` / `disallowedTools` | allow/deny list |
+| `skills` | skills preloaded at spawn |
+| `mcpServers` / `requiredMcpServers` | external tools; the latter gates *availability* |
+| `model` / `effort` | capability vs. cost |
+| `permissionMode` | how much it can do unattended |
+| `maxTurns` | how long it may run |
+| `memory` / `isolation` | persistence scope, worktree/remote sandbox |
+| `omitClaudeMd` | drop project instructions it doesn't need |
+
+**2. Capability is rendered as one line per agent.**
+[`formatAgentLine` prompt.ts:44](cc-code/restored-src/src/tools/AgentTool/prompt.ts#L44):
+
+```ts
+return `- ${agent.agentType}: ${agent.whenToUse} (Tools: ${toolsDescription})`
+```
+
+That is the entire routing table. `getToolsDescription` resolves allow-vs-deny lists into
+human phrasing ("All tools except X, Y") so the model sees *effective* capability rather
+than raw config.
+
+Cache detail worth stealing
+([prompt.ts:48-63](cc-code/restored-src/src/tools/AgentTool/prompt.ts#L48-L63)): this list
+used to live in the tool description and was **~10.2% of fleet `cache_creation` tokens**,
+because any MCP connect or plugin reload mutated it and busted the tool-schema cache. It
+now ships as an `agent_listing_delta` attachment — same routing information, moved out of
+the cached prefix.
+
+**3. The model routes by writing `subagent_type`.** Selection is a tool-call parameter. No
+dispatcher, no scoring function, no embedding match. The prompt teaches the *policy*
+rather than encoding it
+([prompt.ts:151-183](cc-code/restored-src/src/tools/AgentTool/prompt.ts#L151-L183)):
+
+```
+<example_agent_descriptions>
+"test-runner": use this agent after you are done writing code to run tests
+"greeting-responder": use this agent to respond to user greetings with a friendly joke
+</example_agent_descriptions>
+```
+
+**4. The harness enforces what the model chose.** The model picks a *label*; `runAgent`
+makes the label real — filters the tool pool to the allow/deny lists, swaps the model,
+applies `permissionMode`, preloads `skills`, caps `maxTurns`. Misrouting is therefore
+bounded: send a task to `Explore` and it *cannot* write, whatever it was asked to do.
+
+Two enforcement layers sit above that:
+
+- **`allowedAgentTypes`** ([prompt.ts:71-73](cc-code/restored-src/src/tools/AgentTool/prompt.ts#L71-L73))
+  — the permission system's `Agent(x,y)` rule filters the roster *before* it is advertised.
+  An agent the caller may not spawn is never listed.
+- **`requiredMcpServers`** — an agent whose dependencies are not configured drops out of
+  the roster entirely.
+
+**5. The built-in roster shows the dimensions in practice**
+([tools/AgentTool/built-in/](cc-code/restored-src/src/tools/AgentTool/built-in/)):
+
+| Agent | Differentiator |
+|---|---|
+| `Explore` | read-only (`disallowedTools`), `haiku`, `omitClaudeMd: true` |
+| `Plan` | Explore's tools, but `model: 'inherit'` — same reach, more reasoning |
+| `general-purpose` | `tools: ['*']` — the fallback |
+| `claude-code-guide` | `haiku` + `permissionMode: 'dontAsk'` — narrow domain, unattended |
+| `statusline-setup` | `tools: ['Read', 'Edit']` — single-purpose, minimal surface |
+| `verification` | `inherit`, restricted writes |
+
+`Explore`'s `omitClaudeMd` comment is the sharpest capability-as-cost-control example:
+
+> *"Read-only agents (Explore, Plan) don't need commit/PR/lint guidelines — the main agent
+> has full CLAUDE.md and interprets their output. Saves ~5-15 Gtok/week across 34M+ Explore
+> spawns."*
+
+**6. The fork: capability by inheritance.** Omit `subagent_type` and you get a fork
+([prompt.ts:83-100](cc-code/restored-src/src/tools/AgentTool/prompt.ts#L83-L100)) — no
+capability declaration at all, because it inherits the parent's context, tools and prompt
+cache. The prompt is explicit that a fork's prompt is a *directive* ("what to do"), whereas
+a typed subagent's prompt must be a full *briefing* ("brief the agent like a smart
+colleague who just walked into the room"). Routing choice and prompt style are coupled.
+
+### The team/swarm framework: capability assigned at spawn, not pre-declared
+
+Structurally different.
+[`InProcessSpawnConfig`](cc-code/restored-src/src/utils/swarm/spawnInProcess.ts#L59-L72)
+carries no `tools`, no `whenToUse`, no capability declaration:
+
+```ts
+export type InProcessSpawnConfig = {
+  name: string              // "researcher"
+  teamName: string
+  prompt: string            // ← the role lives here
+  color?: string
+  planModeRequired: boolean
+  model?: string
+}
+```
+
+So in a team there is **no roster to route against.** The coordinator invents the
+specialisation in prose and writes it into the prompt.
+[`TeamCreateTool`](cc-code/restored-src/src/tools/TeamCreateTool/TeamCreateTool.ts#L41-L47)
+takes only an optional free-text `agent_type` ("researcher", "test-runner") *"used for team
+file and inter-agent coordination"* — a label for addressing, not a capability contract.
+
+The coordinator's routing policy is prompt text
+([coordinatorMode.ts:111-140](cc-code/restored-src/src/coordinator/coordinatorMode.ts#L111-L140)):
+
+> - Answer questions directly when possible — don't delegate work you can handle without tools
+> - Do not use workers to trivially report file contents or run commands. Give them
+>   higher-level tasks.
+> - **Do not set the model parameter.** Workers need the default model for the substantive
+>   tasks you delegate.
+> - Continue workers whose work is complete via SendMessage **to take advantage of their
+>   loaded context**
+
+That last rule makes *accumulated context* a capability. A worker that already explored the
+auth module is now the best agent for the next auth task — routing no static declaration
+can express, and the reason `SendMessage` exists alongside `AgentTool`.
+
+### The two models, side by side
+
+|  | Subagent | Teammate |
+|---|---|---|
+| Capability defined | ahead of time, as data | at spawn, as prose |
+| Where it's advertised | agent listing in context | nowhere — coordinator invents it |
+| Who routes | the model, via `subagent_type` | the coordinator, via prompt authorship |
+| Enforcement | tools/model/permissions applied at spawn | mostly none; peers are symmetric |
+| Reuse signal | `whenToUse` match | *loaded context* — continue via SendMessage |
+| Best for | recurring, well-typed jobs | evolving, long-lived collaboration |
+
+### The transferable design
+
+1. **Make capability a declaration, not code.** A record with tools, model, permission
+   mode, skills — loadable from a file, so adding an agent is not a deploy.
+2. **Render exactly one line per agent into context.** `name: whenToUse (Tools: …)`. That
+   line *is* the router.
+3. **Keep the routing table out of the cached prefix** if the roster mutates at runtime —
+   this cost 10% of fleet cache-creation tokens before it moved.
+4. **Let the model choose, but enforce the choice.** A misrouted read-only agent is a
+   wasted call; a misrouted write-capable one is an incident. Enforcement is what makes
+   model-driven routing safe.
+5. **Filter the roster by permission before advertising it.** Don't show an agent the
+   caller can't spawn.
+6. **Treat "already has the context" as a first-class routing reason** — offer a
+   continue-an-existing-agent path, not just spawn-a-new-one.
+
+For a domain-skill library this composes with the `paths:` mechanism from [[question 3]]:
+an `equity-research` agent whose `skills:` list preloads the equities skills and whose
+`whenToUse` says when to pick it — declared capability at the agent level, conditional
+visibility at the skill level.
+
+---
+
+## 8. Why `stop_reason != tool_use` can be a loop-exit condition
+
+Short answer: because `tool_use` is the only thing the model can emit that creates an
+*obligation*. Everything else is terminal output.
+
+The twist worth knowing: **the condition is sound in principle, but query.ts explicitly
+refuses to use it** and derives the same signal from message content instead.
+
+### Why the condition is sound
+
+The Messages API turn contract has exactly one content block that leaves something
+outstanding: `tool_use`. `text`, `thinking` and `redacted_thinking` are all terminal — the
+model says something and is done.
+
+A `tool_use` block is different because it is *unanswered*. The API requires every
+`tool_use` to be matched by a `tool_result` in the following user message; send the
+conversation onward without one and the next request 400s (this is the same invariant that
+[[question 1]]'s errors-become-values rule exists to protect). That obligation is the whole
+basis of the loop:
+
+- **tool_use present** → the model asked for something; the harness owes it a result →
+  another request is *required*.
+- **no tool_use** → nothing is pending; the model has produced its final answer for this
+  turn → the loop has no reason to continue.
+
+So the condition is really asking *"who holds the ball?"* The model can only act on the
+world through tool calls, so the absence of a tool call means it has stopped acting and
+started answering. A genuine fixed point, not a heuristic.
+
+### Why Claude Code does not actually use it
+
+[query.ts:553-558](cc-code/restored-src/src/query.ts#L553-L558) — the warning is in the
+source:
+
+```ts
+// @see https://docs.claude.com/en/docs/build-with-claude/tool-use
+// Note: stop_reason === 'tool_use' is unreliable -- it's not always set correctly.
+// Set during streaming whenever a tool_use block arrives — the sole
+// loop-exit signal. If false after streaming, we're done (modulo stop-hook retry).
+const toolUseBlocks: ToolUseBlock[] = []
+let needsFollowUp = false
+```
+
+Three concrete reasons, all visible in the code:
+
+**(a) Streaming timing — it arrives too late.** From
+[claude.ts:2229-2234](cc-code/restored-src/src/services/api/claude.ts#L2229-L2234):
+
+> *"Messages are created at `content_block_stop` from `partialMessage`, which was set at
+> `message_start` before any tokens were generated (`output_tokens: 0`,
+> `stop_reason: null`). `message_delta` arrives **after** `content_block_stop` with the real
+> values."*
+
+The harness has already seen — and with `StreamingToolExecutor`, already *started
+executing* — the tool_use blocks by the time `stop_reason` shows up. It has to be patched
+back onto the message by direct mutation
+([claude.ts:2246-2248](cc-code/restored-src/src/services/api/claude.ts#L2246-L2248)).
+
+**(b) One logical turn can be several assistant messages.** Model fallback restarts a turn
+mid-stream ([query.ts:712-741](cc-code/restored-src/src/query.ts#L712-L741)); server-side
+tools (`server_tool_use`, web search/fetch) run their own internal loop inside a single
+request. `stop_reason` is per-message and only the last one's value survives, whereas
+`needsFollowUp` accumulates across all of them.
+
+**(c) Synthetic messages.** API errors are injected as assistant messages by the harness
+itself (`createAssistantAPIErrorMessage`), so `stop_reason` stops being a faithful report
+of what the model did.
+
+### What it uses instead — the cause, not the report
+
+[query.ts:829-835](cc-code/restored-src/src/query.ts#L829-L835), during streaming:
+
+```ts
+const msgToolUseBlocks = message.message.content.filter(
+  content => content.type === 'tool_use',
+) as ToolUseBlock[]
+if (msgToolUseBlocks.length > 0) {
+  toolUseBlocks.push(...msgToolUseBlocks)
+  needsFollowUp = true
+}
+```
+
+The key insight: **`stop_reason: 'tool_use'` is the API *reporting* that the model emitted
+tool calls; the tool_use blocks themselves are the *fact*.** Reading the content directly
+is strictly more reliable than reading a summary field about the content — and it is
+available earlier in the stream.
+
+### `stop_reason` is still used, just not for this
+
+It carries information that content cannot express — abnormal terminations:
+
+- `'refusal'` → [`getErrorMessageIfRefusal` errors.ts:1184](cc-code/restored-src/src/services/api/errors.ts#L1184)
+- `'max_tokens'` → [claude.ts:2266](cc-code/restored-src/src/services/api/claude.ts#L2266),
+  synthesised into `apiError: 'max_output_tokens'`
+- `'model_context_window_exceeded'` → [claude.ts:2278](cc-code/restored-src/src/services/api/claude.ts#L2278)
+  — *"from the model's perspective, both mean 'response was cut off, continue from where you
+  left off.'"*
+
+These feed the withhold/recovery ladder from [[question 1]]. So `stop_reason` answers
+**"did the turn end abnormally?"**, not **"is there more work?"**
+
+### And "no tool calls" does not mean "return" anyway
+
+In the real loop, `!needsFollowUp` ([query.ts:1062](cc-code/restored-src/src/query.ts#L1062))
+does not exit — it *opens the end-of-turn block*, which has four ways to continue that have
+nothing to do with tool calls:
+
+| Continue reason | Site |
+|---|---|
+| withheld 413 → collapse drain / reactive compact | [1089](cc-code/restored-src/src/query.ts#L1089) · [1119](cc-code/restored-src/src/query.ts#L1119) |
+| max-output-tokens escalate / recover | [1199](cc-code/restored-src/src/query.ts#L1199) · [1223](cc-code/restored-src/src/query.ts#L1223) |
+| stop hook blocking error | [1282](cc-code/restored-src/src/query.ts#L1282) |
+| token-budget continuation | [1316](cc-code/restored-src/src/query.ts#L1316) |
+
+Only after all four decline does it `return { reason: 'completed' }`.
+
+### Takeaway
+
+`stop_reason != 'tool_use'` is the **necessary** condition for stopping, not the
+**sufficient** one — which is exactly what the source comment's parenthetical means by
+"modulo stop-hook retry." The tutorial version of the loop is right to use it; a production
+harness should:
+
+1. Derive the signal from **content** (`tool_use` blocks present?), not from `stop_reason`
+   — the cause is more reliable and arrives earlier than the report.
+2. Accumulate that signal across **all** assistant messages in the turn, not just the last.
+3. Treat "no tool calls" as the entry to end-of-turn processing, not as `return`.
+4. Keep `stop_reason` for what it is uniquely good at: detecting abnormal termination
+   (refusal, truncation, context overflow).
+
 
